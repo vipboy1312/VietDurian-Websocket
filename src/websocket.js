@@ -87,6 +87,10 @@ function initWebSocket(server) {
     ws.isAlive = true;
     ws.rooms = new Set();
 
+    const personalRoom = `user:${ws.userId}`;
+    joinRoom(personalRoom, ws);
+    ws.rooms.add(personalRoom);
+
     console.log(`[WS] Connected: userId=${ws.userId}`);
 
     // Pong resets the heartbeat flag

@@ -1,10 +1,19 @@
-const WebSocket = require('ws');
-const jwt = require('jsonwebtoken');
+const WebSocket = require("ws");
+const jwt = require("jsonwebtoken");
 
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
 
 // ── Room registry: roomId → Set<WebSocket> ──────────────────────────────────
 const rooms = new Map();
+const onlineUsers = new Set();
+
+function broadcastOnlineUsers(wss) {
+  const list = Array.from(onlineUsers);
+  const msg = JSON.stringify({ type: "online_users", userIds: list });
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  });
+}
 
 function joinRoom(roomId, ws) {
   if (!rooms.has(roomId)) rooms.set(roomId, new Set());
@@ -51,76 +60,87 @@ function startHeartbeat(wss) {
     });
   }, PING_INTERVAL_MS);
 
-  wss.on('close', () => clearInterval(interval));
+  wss.on("close", () => clearInterval(interval));
   return interval;
 }
 
 // ── Main init ───────────────────────────────────────────────────────────────
 function initWebSocket(server) {
-  const wss = new WebSocket.Server({ server, path: '/ws' });
+  const wss = new WebSocket.Server({ server, path: "/ws" });
 
   startHeartbeat(wss);
 
-  wss.on('connection', (ws, req) => {
+  wss.on("connection", (ws, req) => {
     // ── Auth via ?token=<jwt> query param ──
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const token = url.searchParams.get('token');
+    const token = url.searchParams.get("token");
     const user = verifyToken(token);
 
     if (!user) {
-      ws.close(4001, 'Unauthorized');
+      ws.close(4001, "Unauthorized");
       return;
     }
 
     ws.userId = user.id || user._id;
+    onlineUsers.add(ws.userId);
+    broadcastOnlineUsers(wss);
     ws.isAlive = true;
     ws.rooms = new Set();
 
     console.log(`[WS] Connected: userId=${ws.userId}`);
 
     // Pong resets the heartbeat flag
-    ws.on('pong', () => {
+    ws.on("pong", () => {
       ws.isAlive = true;
     });
 
     // ── Message handler ──
-    ws.on('message', (raw) => {
+    ws.on("message", (raw) => {
       let msg;
       try {
         msg = JSON.parse(raw);
       } catch {
-        return ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
+        return ws.send(
+          JSON.stringify({ type: "error", message: "Invalid JSON" }),
+        );
       }
 
       handleMessage(ws, msg);
     });
 
     // ── Disconnect cleanup ──
-    ws.on('close', () => {
+    ws.on("close", () => {
+      onlineUsers.delete(ws.userId);
+      broadcastOnlineUsers(wss);
       console.log(`[WS] Disconnected: userId=${ws.userId}`);
       ws.rooms.forEach((roomId) => leaveRoom(roomId, ws));
     });
 
-    ws.on('error', (err) => {
+    ws.on("error", (err) => {
       console.error(`[WS] Error for userId=${ws.userId}:`, err.message);
     });
 
     // Ack connection
-    ws.send(JSON.stringify({ type: 'connected', userId: ws.userId }));
+    ws.send(JSON.stringify({ type: "connected", userId: ws.userId }));
   });
 
   // Notify clients before instance shuts down
-  process.on('SIGTERM', () => {
+  process.on("SIGTERM", () => {
     wss.clients.forEach((ws) => {
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'server_shutdown', message: 'Server restarting, please reconnect' }));
-        ws.close(1001, 'Server shutting down');
+        ws.send(
+          JSON.stringify({
+            type: "server_shutdown",
+            message: "Server restarting, please reconnect",
+          }),
+        );
+        ws.close(1001, "Server shutting down");
       }
     });
     wss.close();
   });
 
-  console.log('[WS] WebSocket server initialised at /ws');
+  console.log("[WS] WebSocket server initialised at /ws");
   return wss;
 }
 
@@ -130,30 +150,38 @@ function handleMessage(ws, msg) {
 
   switch (type) {
     // Client joins a garden/diary room
-    case 'join_room': {
-      if (!roomId) return sendError(ws, 'roomId required');
+    case "join_room": {
+      if (!roomId) return sendError(ws, "roomId required");
       joinRoom(roomId, ws);
       ws.rooms.add(roomId);
-      ws.send(JSON.stringify({ type: 'room_joined', roomId }));
-      broadcastToRoom(roomId, { type: 'user_joined', roomId, userId: ws.userId }, ws);
+      ws.send(JSON.stringify({ type: "room_joined", roomId }));
+      broadcastToRoom(
+        roomId,
+        { type: "user_joined", roomId, userId: ws.userId },
+        ws,
+      );
       break;
     }
 
     // Client leaves a room
-    case 'leave_room': {
-      if (!roomId) return sendError(ws, 'roomId required');
+    case "leave_room": {
+      if (!roomId) return sendError(ws, "roomId required");
       leaveRoom(roomId, ws);
       ws.rooms.delete(roomId);
-      ws.send(JSON.stringify({ type: 'room_left', roomId }));
-      broadcastToRoom(roomId, { type: 'user_left', roomId, userId: ws.userId }, ws);
+      ws.send(JSON.stringify({ type: "room_left", roomId }));
+      broadcastToRoom(
+        roomId,
+        { type: "user_left", roomId, userId: ws.userId },
+        ws,
+      );
       break;
     }
 
     // Broadcast a message to all room members
-    case 'message': {
-      if (!roomId) return sendError(ws, 'roomId required');
+    case "message": {
+      if (!roomId) return sendError(ws, "roomId required");
       broadcastToRoom(roomId, {
-        type: 'message',
+        type: "message",
         roomId,
         senderId: ws.userId,
         payload,
@@ -163,33 +191,41 @@ function handleMessage(ws, msg) {
     }
 
     // Diary update notifications (e.g. someone edits a diary entry)
-    case 'diary_updated': {
-      if (!roomId) return sendError(ws, 'roomId required');
-      broadcastToRoom(roomId, {
-        type: 'diary_updated',
+    case "diary_updated": {
+      if (!roomId) return sendError(ws, "roomId required");
+      broadcastToRoom(
         roomId,
-        updatedBy: ws.userId,
-        payload,
-        timestamp: new Date().toISOString(),
-      }, ws);
+        {
+          type: "diary_updated",
+          roomId,
+          updatedBy: ws.userId,
+          payload,
+          timestamp: new Date().toISOString(),
+        },
+        ws,
+      );
       break;
     }
 
     // Garden sensor / IoT data push
-    case 'sensor_data': {
-      if (!roomId) return sendError(ws, 'roomId required');
-      broadcastToRoom(roomId, {
-        type: 'sensor_data',
+    case "sensor_data": {
+      if (!roomId) return sendError(ws, "roomId required");
+      broadcastToRoom(
         roomId,
-        payload,
-        timestamp: new Date().toISOString(),
-      }, ws);
+        {
+          type: "sensor_data",
+          roomId,
+          payload,
+          timestamp: new Date().toISOString(),
+        },
+        ws,
+      );
       break;
     }
 
     // Ping/pong for client-side keepalive
-    case 'ping': {
-      ws.send(JSON.stringify({ type: 'pong' }));
+    case "ping": {
+      ws.send(JSON.stringify({ type: "pong" }));
       break;
     }
 
@@ -199,7 +235,7 @@ function handleMessage(ws, msg) {
 }
 
 function sendError(ws, message) {
-  ws.send(JSON.stringify({ type: 'error', message }));
+  ws.send(JSON.stringify({ type: "error", message }));
 }
 
 module.exports = { initWebSocket };
